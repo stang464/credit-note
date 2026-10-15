@@ -1,0 +1,602 @@
+openapi: 3.0.3
+info:
+  title: Card Book API
+  version: 1.0.0
+  description: |
+    REST API ของสมุดบัตรเครดิต โครงสร้างข้อมูลตรงกับ ER diagram (cards, categories, transactions, installment_plans)
+    ตาราง statements ไม่เปิดเป็น endpoint ฝั่งหน้าเว็บคำนวณรอบบิลจาก `statement_month` ของ transactions
+
+    **การยืนยันตัวตน**
+    1. `POST /v1/auth/register` หรือ `POST /v1/auth/login` ด้วยอีเมลและรหัสผ่าน ได้ `access_token`
+    2. ทุก endpoint อื่นต้องส่งหัว `Authorization: Bearer <access_token>`
+    3. token ไม่ถูกต้อง หมดอายุ หรือถูกเพิกถอน ตอบ `401` และหน้าเว็บจะพากลับไปหน้า Login
+    4. `POST /v1/auth/logout` เพิกถอน token ปัจจุบัน
+
+    **ข้อกำหนดฝั่งเซิร์ฟเวอร์ที่ควรทำ**
+    - ข้อมูลทุกแถวผูกกับผู้ใช้ที่ถือ token เท่านั้น ผู้ใช้ไม่เห็นข้อมูลของคนอื่น (ถ้าไม่ใช่เจ้าของ ตอบ `404`)
+    - เก็บรหัสผ่านด้วย argon2id หรือ bcrypt ห้ามเก็บเป็นข้อความธรรมดา
+    - เก็บ token ฝั่งเซิร์ฟเวอร์เป็นค่าแฮช อายุสั้น (แนะนำไม่เกิน 8 ชั่วโมง) และเพิกถอนได้
+    - เปิด CORS เฉพาะโดเมนที่โฮสต์หน้าเว็บ และอนุญาตหัว `Authorization`, `Content-Type`
+    - จำกัดจำนวนครั้ง login ต่ออีเมลและต่อ IP
+
+    **งวดผ่อนคือ transaction**
+    `POST /v1/installment-plans` สร้างแผน 1 แถว และสร้างแถว `transactions` ครบทุกงวดทันที
+    (`txn_type = INSTALLMENT`, `installment_no` 1..term_count, `status = PENDING`)
+    ส่วนค่าที่คำนวณ (`paid_terms`, `remaining_terms`, `remaining_balance`) ได้จากแถวเหล่านั้น ไม่เก็บซ้ำในแผน
+  contact:
+    name: Card Book
+servers:
+  - url: https://api.example.com
+    description: เปลี่ยนเป็นโดเมน BE ของคุณ
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth
+  - name: Cards
+  - name: Categories
+  - name: Transactions
+  - name: Installment plans
+paths:
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: สมัครสมาชิก
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, maxLength: 100 }
+                name: { type: string, maxLength: 60 }
+            example: { email: me@example.com, password: "correct-horse-1", name: สมชาย }
+      responses:
+        '201':
+          description: สมัครสำเร็จและเข้าสู่ระบบทันที
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResult' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: เข้าสู่ระบบ
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResult' }
+        '401':
+          description: อีเมลหรือรหัสผ่านไม่ถูกต้อง (`code = invalid_credentials`) ใช้ข้อความเดียวกันทั้งกรณีไม่มีอีเมลและรหัสผ่านผิด
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: ออกจากระบบและเพิกถอน token ปัจจุบัน
+      responses:
+        '204': { description: เพิกถอนแล้ว }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/me:
+    get:
+      tags: [Auth]
+      summary: ข้อมูลผู้ใช้ของ token นี้ (ใช้ตรวจ token ตอนเปิดหน้าเว็บ)
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/cards:
+    get:
+      tags: [Cards]
+      summary: รายการบัตร
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Card' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Cards]
+      summary: เพิ่มบัตร
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CardInput' }
+      responses:
+        '201':
+          description: สร้างแล้ว
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /v1/cards/{card_id}:
+    parameters:
+      - $ref: '#/components/parameters/CardId'
+    get:
+      tags: [Cards]
+      summary: ดูบัตรใบเดียว
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Cards]
+      summary: แก้ไขบัตร (ส่งเฉพาะฟิลด์ที่เปลี่ยน)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CardPatch' }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Cards]
+      summary: ลบบัตร พร้อมรายการใช้จ่าย แผนผ่อน และงวดผ่อนทั้งหมดของบัตรนั้น (cascade)
+      responses:
+        '204': { description: ลบแล้ว }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/categories:
+    get:
+      tags: [Categories]
+      summary: หมวดหมู่รายการใช้จ่าย
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/transactions:
+    get:
+      tags: [Transactions]
+      summary: รายการเงินทั้งหมด (รูดบัตรและงวดผ่อน) เรียงตาม txn_date ใหม่ไปเก่า
+      parameters:
+        - { name: card_id, in: query, schema: { type: string, format: uuid } }
+        - { name: txn_type, in: query, schema: { $ref: '#/components/schemas/TxnType' } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/TxnStatus' } }
+        - { name: plan_id, in: query, schema: { type: string, format: uuid } }
+        - name: statement_month
+          in: query
+          description: วันที่ 1 ของเดือนรอบบิล เช่น 2026-10-01
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Transactions]
+      summary: บันทึกรายการใช้จ่าย
+      description: |
+        สร้างได้เฉพาะ `PURCHASE`, `FEE`, `REFUND` ส่วนงวดผ่อนสร้างผ่าน `/v1/installment-plans`
+        เซิร์ฟเวอร์คำนวณ `statement_month` เองจากวันตัดรอบของบัตร (ใช้หลังวันตัดรอบ นับเข้ารอบถัดไป) และตั้ง `status = POSTED`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionInput' }
+            example: { txn_type: PURCHASE, card_id: 3f1c2d0e-5b7a-4c1e-9a53-0d2f6a1b9c11, txn_date: "2026-10-14", description: ซูเปอร์มาร์เก็ต, category_id: cat_food, amount: 1250 }
+      responses:
+        '201':
+          description: สร้างแล้ว
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /v1/transactions/{txn_id}:
+    parameters:
+      - name: txn_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Transactions]
+      summary: ดูรายการเดียว
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Transactions]
+      summary: ลบรายการใช้จ่าย
+      description: ลบแถว `INSTALLMENT` โดยตรงไม่ได้ ตอบ `409 installment_row` ให้ใช้ `DELETE /v1/installment-plans/{plan_id}` แทน
+      responses:
+        '204': { description: ลบแล้ว }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/installment-plans:
+    get:
+      tags: [Installment plans]
+      summary: รายการแผนผ่อน พร้อมค่าที่คำนวณจากงวด
+      parameters:
+        - { name: card_id, in: query, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/InstallmentPlan' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Installment plans]
+      summary: สร้างแผนผ่อน และสร้างงวดครบทุกงวดเป็น transactions
+      description: |
+        สร้าง `installment_plans` 1 แถว กับ `transactions` จำนวน `term_count` แถวใน transaction เดียว (atomic)
+        งวดที่ k มี `statement_month` = `first_statement_month` + (k − 1) เดือน, `txn_date` = วันตัดรอบของเดือนนั้น,
+        `amount` = `monthly_amount` และ `status` = `PAID` เมื่อ k ≤ `paid_terms` นอกนั้น `PENDING`
+        ฐานข้อมูลต้องมี unique (plan_id, installment_no)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstallmentPlanInput' }
+            example: { card_id: 3f1c2d0e-5b7a-4c1e-9a53-0d2f6a1b9c11, item_name: โทรศัพท์มือถือ, principal: 32000, term_count: 10, monthly_amount: 3200, first_statement_month: "2026-08-01", paid_terms: 2 }
+      responses:
+        '201':
+          description: สร้างแล้ว
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallmentPlan' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /v1/installment-plans/{plan_id}:
+    parameters:
+      - $ref: '#/components/parameters/PlanId'
+    get:
+      tags: [Installment plans]
+      summary: ดูแผนผ่อนเดียว
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallmentPlan' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Installment plans]
+      summary: แก้ไขแผนผ่อน
+      description: |
+        ส่งเฉพาะฟิลด์ที่เปลี่ยน งวดที่ `PAID` และอยู่ในช่วง 1..min(paid เดิม, paid_terms ใหม่) คงไว้ตามเดิม
+        งวดที่เหลือถูกลบและสร้างใหม่ตามค่าใหม่ (จำนวนงวด ยอดต่อเดือน เดือนเริ่ม บัตร)
+        ถ้าไม่ส่ง `paid_terms` ใช้จำนวนงวดที่จ่ายแล้วปัจจุบัน
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstallmentPlanPatch' }
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallmentPlan' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Installment plans]
+      summary: ลบแผนผ่อนและงวดทั้งหมดของแผน (cascade)
+      responses:
+        '204': { description: ลบแล้ว }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/installment-plans/{plan_id}/installments:
+    parameters:
+      - $ref: '#/components/parameters/PlanId'
+    get:
+      tags: [Installment plans]
+      summary: งวดทั้งหมดของแผน (แถว transactions เรียงตาม installment_no)
+      responses:
+        '200':
+          description: สำเร็จ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/installment-plans/{plan_id}/pay:
+    parameters:
+      - $ref: '#/components/parameters/PlanId'
+    post:
+      tags: [Installment plans]
+      summary: จ่ายงวดนี้แล้ว (ปิดงวดที่ค้างเก่าสุดของแผน)
+      description: ตั้งงวด `PENDING` ที่ `installment_no` น้อยที่สุดเป็น `PAID` พร้อม `paid_at` วันนี้ ถ้าไม่เหลืองวด ตอบ `409 nothing_to_pay`
+      responses:
+        '200':
+          description: แผนหลังอัปเดต
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallmentPlan' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/installment-plans/{plan_id}/unpay:
+    parameters:
+      - $ref: '#/components/parameters/PlanId'
+    post:
+      tags: [Installment plans]
+      summary: ยกเลิกจ่ายงวดล่าสุด
+      description: ตั้งงวด `PAID` ที่ `installment_no` มากที่สุดกลับเป็น `PENDING` และล้าง `paid_at` ถ้าไม่มีงวดที่จ่ายแล้ว ตอบ `409 nothing_to_undo`
+      responses:
+        '200':
+          description: แผนหลังอัปเดต
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallmentPlan' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'ส่งหัว `Authorization: Bearer <access_token>` ที่ได้จาก login หรือ register'
+  parameters:
+    CardId:
+      name: card_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PlanId:
+      name: plan_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Unauthorized:
+      description: ไม่มี token, token ไม่ถูกต้อง, หมดอายุ หรือถูกเพิกถอน (`code = unauthorized`) หน้าเว็บจะล้าง token และพากลับหน้า Login
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: ไม่พบข้อมูล หรือไม่ใช่ข้อมูลของผู้ใช้ที่ถือ token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: ขัดแย้งกับข้อมูลที่มีอยู่ เช่น `email_taken`, `duplicate_name`, `installment_row`, `nothing_to_pay`, `nothing_to_undo`
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: ข้อมูลไม่ถูกต้อง `fields` ระบุฟิลด์ที่ผิดพร้อมข้อความ
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: validation_error
+              message: "ข้อมูลไม่ถูกต้อง: จำนวนงวดต้องเป็น 1-120"
+              fields: { term_count: จำนวนงวดต้องเป็น 1-120 }
+    TooManyRequests:
+      description: เรียกถี่เกินไป ส่งหัว `Retry-After` (วินาที)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: unauthorized }
+            message: { type: string, description: ข้อความภาษาไทยที่หน้าเว็บแสดงให้ผู้ใช้เห็นได้เลย }
+            fields:
+              type: object
+              additionalProperties: { type: string }
+    User:
+      type: object
+      required: [user_id, email, name]
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+    AuthResult:
+      type: object
+      required: [access_token, token_type, expires_in, user]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer, description: อายุ token เป็นวินาที, example: 28800 }
+        user: { $ref: '#/components/schemas/User' }
+    Category:
+      type: object
+      required: [category_id, name]
+      properties:
+        category_id: { type: string, example: cat_food }
+        name: { type: string, example: อาหาร }
+    CardColor:
+      type: string
+      enum: [blue, teal, violet, orange, rose, green, slate]
+    Card:
+      type: object
+      required: [card_id, name, credit_limit, statement_day, due_day, color, is_active]
+      properties:
+        card_id: { type: string, format: uuid }
+        name: { type: string, maxLength: 40 }
+        bank: { type: string, nullable: true, maxLength: 40 }
+        last4: { type: string, nullable: true, pattern: '^[0-9]{4}$' }
+        credit_limit: { type: number, minimum: 0, exclusiveMinimum: true }
+        statement_day: { type: integer, minimum: 1, maximum: 31, description: วันตัดรอบบิล }
+        due_day: { type: integer, minimum: 1, maximum: 31, description: วันครบกำหนดชำระ }
+        color: { $ref: '#/components/schemas/CardColor' }
+        is_active: { type: boolean }
+    CardInput:
+      type: object
+      required: [name, credit_limit, statement_day, due_day]
+      properties:
+        name: { type: string, maxLength: 40, description: ไม่ซ้ำกันภายในบัญชีเดียวกัน }
+        bank: { type: string, nullable: true, maxLength: 40 }
+        last4: { type: string, nullable: true, pattern: '^[0-9]{4}$' }
+        credit_limit: { type: number, minimum: 0, exclusiveMinimum: true }
+        statement_day: { type: integer, minimum: 1, maximum: 31 }
+        due_day: { type: integer, minimum: 1, maximum: 31 }
+        color: { $ref: '#/components/schemas/CardColor' }
+    CardPatch:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, maxLength: 40 }
+        bank: { type: string, nullable: true, maxLength: 40 }
+        last4: { type: string, nullable: true, pattern: '^[0-9]{4}$' }
+        credit_limit: { type: number, minimum: 0, exclusiveMinimum: true }
+        statement_day: { type: integer, minimum: 1, maximum: 31 }
+        due_day: { type: integer, minimum: 1, maximum: 31 }
+        color: { $ref: '#/components/schemas/CardColor' }
+        is_active: { type: boolean }
+    TxnType:
+      type: string
+      enum: [PURCHASE, INSTALLMENT, FEE, REFUND]
+    TxnStatus:
+      type: string
+      description: |
+        `POSTED` รายการใช้จ่ายทั่วไป · `PENDING` งวดผ่อนที่ยังไม่จ่าย · `PAID` งวดผ่อนที่จ่ายแล้ว · `VOID` ยกเลิก
+      enum: [POSTED, PENDING, PAID, VOID]
+    Transaction:
+      type: object
+      required: [txn_id, card_id, txn_type, txn_date, statement_month, amount, status]
+      properties:
+        txn_id: { type: string, format: uuid }
+        card_id: { type: string, format: uuid }
+        statement_id: { type: string, format: uuid, nullable: true }
+        category_id: { type: string, nullable: true }
+        plan_id: { type: string, format: uuid, nullable: true, description: มีค่าเฉพาะงวดผ่อน }
+        installment_no: { type: integer, nullable: true, description: งวดที่ 1 ถึง term_count }
+        txn_type: { $ref: '#/components/schemas/TxnType' }
+        txn_date: { type: string, format: date }
+        statement_month: { type: string, format: date, description: วันที่ 1 ของเดือนรอบบิล }
+        description: { type: string, nullable: true, maxLength: 80 }
+        amount: { type: number, minimum: 0, exclusiveMinimum: true }
+        status: { $ref: '#/components/schemas/TxnStatus' }
+        paid_at: { type: string, format: date, nullable: true }
+    TransactionInput:
+      type: object
+      required: [card_id, txn_date, amount]
+      properties:
+        txn_type: { type: string, enum: [PURCHASE, FEE, REFUND], default: PURCHASE }
+        card_id: { type: string, format: uuid }
+        txn_date: { type: string, format: date }
+        description: { type: string, maxLength: 80 }
+        category_id: { type: string, nullable: true }
+        amount: { type: number, minimum: 0, exclusiveMinimum: true }
+    InstallmentPlan:
+      type: object
+      required: [plan_id, card_id, item_name, term_count, monthly_amount, first_statement_month, status, paid_terms, remaining_terms, remaining_balance]
+      properties:
+        plan_id: { type: string, format: uuid }
+        card_id: { type: string, format: uuid }
+        item_name: { type: string, maxLength: 80 }
+        principal: { type: number, nullable: true, description: ราคาสินค้า (ไม่บังคับ) }
+        term_count: { type: integer, minimum: 1, maximum: 120 }
+        monthly_amount: { type: number, minimum: 0, exclusiveMinimum: true }
+        first_statement_month: { type: string, format: date, description: วันที่ 1 ของเดือนรอบบิลของงวดแรก }
+        status: { type: string, enum: [ACTIVE, COMPLETED, CANCELLED], description: เซิร์ฟเวอร์ตอบ COMPLETED เมื่อจ่ายครบทุกงวด }
+        note: { type: string, nullable: true }
+        paid_terms: { type: integer, readOnly: true, description: จำนวนงวด PAID (คำนวณ) }
+        remaining_terms: { type: integer, readOnly: true, description: term_count − paid_terms (คำนวณ) }
+        remaining_balance: { type: number, readOnly: true, description: ผลรวม amount ของงวด PENDING (คำนวณ) }
+    InstallmentPlanInput:
+      type: object
+      required: [card_id, item_name, term_count, monthly_amount, first_statement_month]
+      properties:
+        card_id: { type: string, format: uuid }
+        item_name: { type: string, maxLength: 80 }
+        principal: { type: number, nullable: true, minimum: 0 }
+        term_count: { type: integer, minimum: 1, maximum: 120 }
+        monthly_amount: { type: number, minimum: 0, exclusiveMinimum: true }
+        first_statement_month: { type: string, format: date, description: รับวันที่ใดก็ได้ในเดือนนั้น เซิร์ฟเวอร์ปรับเป็นวันที่ 1 }
+        paid_terms: { type: integer, minimum: 0, default: 0, description: จำนวนงวดที่ชำระแล้วตอนสร้าง (ต้องไม่เกิน term_count) }
+        note: { type: string, nullable: true }
+    InstallmentPlanPatch:
+      type: object
+      minProperties: 1
+      properties:
+        card_id: { type: string, format: uuid }
+        item_name: { type: string, maxLength: 80 }
+        principal: { type: number, nullable: true, minimum: 0 }
+        term_count: { type: integer, minimum: 1, maximum: 120 }
+        monthly_amount: { type: number, minimum: 0, exclusiveMinimum: true }
+        first_statement_month: { type: string, format: date }
+        paid_terms: { type: integer, minimum: 0 }
+        note: { type: string, nullable: true }
